@@ -279,7 +279,7 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->mss = kcp->mtu - IKCP_OVERHEAD;
 	kcp->stream = 0;
 
-	kcp->buffer = (char*)ikcp_malloc((kcp->mtu + IKCP_OVERHEAD) * 3);  //实际内存只用到mtu大小，可优化
+	kcp->buffer = (char*)ikcp_malloc((kcp->mtu + IKCP_OVERHEAD) * 3);  //实际内存只用到mtu大小，可优化为mtu大小(如果要在首尾添加其他协议，也可以多分配一些内存)
 	if (kcp->buffer == NULL) {
 		ikcp_free(kcp);
 		return NULL;
@@ -971,14 +971,16 @@ static int ikcp_wnd_unused(const ikcpcb *kcp)
 
 //---------------------------------------------------------------------
 // ikcp_flush
+// 用户不要直接调用ikcp_flush，因为ikcp_flush依赖kcp->current；如果真想调用，应该先调用一次ikcp_update， ikcp_update会更新kcp->current.
+//
 // 1. 发送数据时，首先进行封包(具有IKCP_OVERHEAD协议头)，如果多个封包可以放在一个MTU中发送，则会进行合并，一次性发送提高效率
 //    因此，在解析时应该循环解析
 // 2. 信令包(ack,probe)都为24个字节(IKCP_OVERHEAD头中)，并且只发送一次，发送完了便清除，不会重传
 //---------------------------------------------------------------------
 void ikcp_flush(ikcpcb *kcp)
 {
-	IUINT32 current = kcp->current;
-	char *buffer = kcp->buffer;
+	IUINT32 current = kcp->current; //此处依赖kcp->current
+	char *buffer = kcp->buffer; //如果要实现linux skb buffer类似的协议组装，则可以让kcp->buffer多分配一些内存，buffer不去用首尾的内存,以便output后扩展其他协议
 	char *ptr = buffer;
 	int count, size, i;
 	IUINT32 resent, cwnd;
@@ -1199,6 +1201,11 @@ void ikcp_flush(ikcpcb *kcp)
 // ikcp_check when to call it again (without ikcp_input/_send calling).
 // 'current' - current timestamp in millisec. 
 //---------------------------------------------------------------------
+// 需要注意的是:
+// 1. 调用ikcp_update不一定会触发ikcp_flush，因为ikcp_update是按照每隔kcp->interval触发一次;
+// 2. 每次调用ikcp_update都会更新kcp->current;
+// 3. 用户可以设置一个定时器，周期的调用ikcp_update，定时器间隔为kcp->interval;
+//
 void ikcp_update(ikcpcb *kcp, IUINT32 current)
 {
 	IINT32 slap;
@@ -1236,6 +1243,28 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 // schedule ikcp_update (eg. implementing an epoll-like mechanism, 
 // or optimize ikcp_update when handling massive kcp connections)
 //---------------------------------------------------------------------
+// 1. 使用方式：(如下使用参考摘自issue: what is the best practices with ikcp_check #138)
+//  	while (1) {
+//  		current = clock();
+//  		ikcp_update(current);
+//  		ts = ikcp_check();
+//  		Sleep(ts - current);
+//  	}
+//    实际的话，你需要同时管理 N 个 kcp 对象的 ikcp_check 返回时间，放到 timer里调度：
+//        如果到时间了，那么执行 ikcp_update，并且重新 check，确定下一次时间，放入 timer 调度。
+//        如果有数据包 ikcp_input 进来了，那么 ikcp_update，再 check 重新调度。
+//    每个链接都有自己的一个 timer id，使用 linux 时间轮算法，O(1) 的时钟调度。
+//    
+//
+// 2. 这个接口有些争议：
+//   a. ikcp_check检测的是重传的时间点、interval时间点，最大不超过interval时间点；但实际只有interval时间点起作用.
+//       如果检测到重传，但是interval时间点还未到，这时去调用ikcp_update，ikcp_update根本不会触发ikcp_flush，所以这个检测重传时间点没有意义；
+//       感觉把最个检测重传时间点放进ikcp_update函数中可能会更有用, 放在ikcp_check起不到作用.
+//   b. 从ikcp_check代码来看的确起不到降低CPU的作用
+//      除非我代码是死循环不带延时的调用update, 那调用ikcp_check才能达到比之前的CPU占用低的目的, 
+//      如果我本身代码里面就有延时 10 ms(假设interval为10ms), 那即使调用ikcp_check, 根据ikcp_check返回值我还是顶多只能sleep 10ms.
+//   c. 最理想的ikcp_check接口应该是能够不需要interval了，直接通过ikcp_check知道下次刷新时间点，但是目前ikcp_update和ikcp_check的实现并未支持.
+//
 IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 {
 	IUINT32 ts_flush = kcp->ts_flush;
@@ -1263,7 +1292,7 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 		const IKCPSEG *seg = iqueue_entry(p, const IKCPSEG, node);
 		IINT32 diff = _itimediff(seg->resendts, current);
 		if (diff <= 0) {
-			return current; //队列中的某个包的重传时间已到，应立即调用
+			return current; //队列中的某个包的重传时间已到，应立即调用 (这里有争议，感觉是检测重传时间点是多余的)
 		}
 		if (diff < tm_packet) tm_packet = diff;
 	}
@@ -1281,7 +1310,7 @@ int ikcp_setmtu(ikcpcb *kcp, int mtu)
 	char *buffer;
 	if (mtu < 50 || mtu < (int)IKCP_OVERHEAD) 
 		return -1;
-	buffer = (char*)ikcp_malloc((mtu + IKCP_OVERHEAD) * 3); //实际内存只用到mtu大小，可优化
+	buffer = (char*)ikcp_malloc((mtu + IKCP_OVERHEAD) * 3); //实际内存只用到mtu大小，可优化为mtu大小(如果要在首尾添加其他协议，也可以多分配一些内存)
 	if (buffer == NULL) 
 		return -2;
 	kcp->mtu = mtu;
