@@ -279,6 +279,8 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->mss = kcp->mtu - IKCP_OVERHEAD;
 	kcp->stream = 0;
 
+	//kcp->buffer这块内存用途：在输出数据之前会把数据在这块内存上组装协议头，并且多个包可以合并在buffer上一次性输出。
+	//                      此外，可以效仿linux skb_buf一样，在首尾空出一些内存，把buffer交给下层协议栈组装数据
 	kcp->buffer = (char*)ikcp_malloc((kcp->mtu + IKCP_OVERHEAD) * 3);  //实际内存只用到mtu大小，可优化为mtu大小(如果要在首尾添加其他协议，也可以多分配一些内存)
 	if (kcp->buffer == NULL) {
 		ikcp_free(kcp);
