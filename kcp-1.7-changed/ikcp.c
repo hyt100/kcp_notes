@@ -381,6 +381,7 @@ void ikcp_setoutput(ikcpcb *kcp, int (*output)(const char *buf, int len,
 // user/upper level recv: returns size, returns below zero for EAGAIN
 //---------------------------------------------------------------------
 // 获取第一个可读的包，如果有多个可读的包应该调用多次，直到返回失败
+// 注意：返回值为0则表示对方发了一个长度为0的包
 int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 {
 	struct IQUEUEHEAD *p;
@@ -498,6 +499,7 @@ int ikcp_peeksize(const ikcpcb *kcp)
 // 默认为包模式，也没有提供接口修改设置，用户可直接修改变量进行配置：
 //       kcp->stream = 0;  //包模式 (假设MSS为500，发送方依次发送100,200,300字节，接收方依次收到100,200,300字节)
 //       kcp->stream = 1;  //流模式 (假设MSS为500，发送方依次发送100,200,300字节，接收方依次收到500,100字节)
+// 注意：可以发送长度为0的包，对方将会收到KCP头(24字节)，其len为0 (这个功能可以用来模拟实现shutdown写端来有序关闭，0作为结束符，对方ikcp_recv为0则读结束)
 int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 {
 	IKCPSEG *seg;
